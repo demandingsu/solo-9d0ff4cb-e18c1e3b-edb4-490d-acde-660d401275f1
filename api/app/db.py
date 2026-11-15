@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS records (
     report_no   TEXT NOT NULL,             -- 报告编号
     sample_no   TEXT,                      -- 样品号
     report_time INTEGER NOT NULL,          -- 报告时间，epoch 秒
-    result      TEXT                       -- 结果
+    result      TEXT,                      -- 结果
+    replaces_report_no TEXT                -- 更正报告指向的原报告编号，NULL 表示非更正
 );
 CREATE INDEX IF NOT EXISTS idx_records_task ON records(task_id, round);
 
@@ -61,10 +62,17 @@ CREATE TABLE IF NOT EXISTS published_records (
     report_no      TEXT NOT NULL,
     sample_no      TEXT,
     report_time    INTEGER NOT NULL,
-    result         TEXT
+    result         TEXT,
+    replaced_chain TEXT NOT NULL DEFAULT '[]'  -- JSON 数组：该末端报告替代过的编号链（旧→新），无更正为 []
 );
 CREATE INDEX IF NOT EXISTS idx_published_records_pub ON published_records(publication_id);
 """
+
+# 旧版本数据库的增量迁移（CREATE TABLE IF NOT EXISTS 不会补齐已存在表的新列）。
+MIGRATIONS = (
+    ("records", "replaces_report_no", "TEXT"),
+    ("published_records", "replaced_chain", "TEXT NOT NULL DEFAULT '[]'"),
+)
 
 
 def init_db() -> None:
@@ -73,6 +81,10 @@ def init_db() -> None:
         os.makedirs(directory, exist_ok=True)
     with connect() as conn:
         conn.executescript(SCHEMA)
+        for table, column, decl in MIGRATIONS:
+            cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 @contextmanager

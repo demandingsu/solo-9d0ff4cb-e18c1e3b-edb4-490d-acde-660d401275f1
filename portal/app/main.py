@@ -73,7 +73,8 @@ def query_reports(start: str, end: str):
     with db.connect() as conn:
         batch = db.get_meta(conn, "batch")
         rows = conn.execute(
-            "SELECT report_no, sample_no, report_time, result FROM reports"
+            "SELECT report_no, sample_no, report_time, result, replaces_report_no"
+            " FROM reports"
             " WHERE report_time >= ? AND report_time < ?"
             " ORDER BY report_time, report_no",
             (s, e),
@@ -90,6 +91,7 @@ def query_reports(start: str, end: str):
                 "sample_no": r["sample_no"],
                 "report_time": fmt_ts(r["report_time"]),
                 "result": r["result"],
+                "replaces_report_no": r["replaces_report_no"],
             }
             for r in items
         ],
@@ -139,10 +141,93 @@ def seed_reports(body: SeedBody):
     return {"inserted": body.count}
 
 
+class CorrectBody(BaseModel):
+    replaces: str                          # 被替代的原报告编号
+    report_no: Optional[str] = None        # 更正报告编号，缺省自动生成
+    sample_no: Optional[str] = None        # 缺省沿用原报告样品号
+    result: Optional[str] = None           # 缺省沿用原报告结果
+    time: Optional[str] = None             # 缺省沿用原报告时间；指定后可落在不同查询子区间
+    allow_missing: bool = False            # True 时允许原报告不存在（用于造缺失引用）
+
+
+@app.post("/admin/correct", status_code=201)
+def add_correction(body: CorrectBody):
+    """针对已存在报告造一份更正报告，replaces_report_no 指向原报告。
+
+    指定 ``time`` 可让更正报告落在与原报告不同的查询子区间，验证补采 API
+    跨子区间的更正链归并。门户不做更正链合法性校验，冲突由补采 API 检测。
+    """
+    try:
+        fixed_ts = parse_ts(body.time) if body.time is not None else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"时间参数错误: {exc}") from exc
+
+    with db.connect() as conn:
+        seq = int(db.get_meta(conn, "seq"))
+        original = conn.execute(
+            "SELECT * FROM reports WHERE report_no = ? ORDER BY id LIMIT 1",
+            (body.replaces,),
+        ).fetchone()
+        if original is None and not body.allow_missing:
+            raise HTTPException(status_code=404, detail=f"原报告不存在: {body.replaces}")
+        report_no = body.report_no
+        if report_no is None:
+            seq += 1
+            report_no = f"RPT-{seq:06d}"
+            db.set_meta(conn, "seq", str(seq))
+        sample_no = body.sample_no or (original["sample_no"] if original else f"SAM-{report_no}")
+        result = body.result if body.result is not None else (
+            original["result"] if original else "合格"
+        )
+        report_time = fixed_ts if fixed_ts is not None else (
+            original["report_time"] if original else 0
+        )
+        conn.execute(
+            "INSERT INTO reports(report_no, sample_no, report_time, result,"
+            " replaces_report_no) VALUES(?,?,?,?,?)",
+            (report_no, sample_no, report_time, result, body.replaces),
+        )
+    return {
+        "report_no": report_no,
+        "replaces_report_no": body.replaces,
+        "report_time": fmt_ts(report_time),
+    }
+
+
+class RawReportBody(BaseModel):
+    report_no: str
+    sample_no: str = "SAM-MANUAL"
+    time: str
+    result: str = "合格"
+    replaces_report_no: Optional[str] = None  # 空/缺省表示普通报告
+
+
+@app.post("/admin/reports", status_code=201)
+def add_raw_report(body: RawReportBody):
+    """插入任意原始报告（允许重复编号、成环、缺失引用等异常数据）。
+
+    用于构造补采 API 必须拒绝的更正链冲突；门户本身不校验引用合法性。
+    """
+    try:
+        report_time = parse_ts(body.time)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"时间参数错误: {exc}") from exc
+    replaces = body.replaces_report_no.strip() if body.replaces_report_no else None
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO reports(report_no, sample_no, report_time, result,"
+            " replaces_report_no) VALUES(?,?,?,?,?)",
+            (body.report_no, body.sample_no, report_time, body.result, replaces),
+        )
+    return {
+        "report_no": body.report_no,
+        "replaces_report_no": replaces,
+        "report_time": fmt_ts(report_time),
+    }
+
+
 class SwitchBatchBody(BaseModel):
     after_queries: int = Field(default=0, ge=0)  # >0：再响应 N 次查询后自动换批
-
-
 @app.post("/admin/switch-batch")
 def switch_batch(body: SwitchBatchBody):
     """换批：默认立即切换发布批次；after_queries>0 时按计划自动切换。"""
@@ -177,6 +262,14 @@ def inject_failure(body: FailBody):
             db.set_meta(conn, "fail_pending", "0")
             db.set_meta(conn, "fail_remaining", str(body.times))
     return {"fail_remaining": body.times, "after_queries": body.after_queries}
+
+
+@app.delete("/admin/reports/{report_no}")
+def delete_report(report_no: str):
+    """按编号删除报告（删除重复编号时一并删除同号记录），用于冲突修复演示。"""
+    with db.connect() as conn:
+        cur = conn.execute("DELETE FROM reports WHERE report_no = ?", (report_no,))
+    return {"deleted": cur.rowcount, "report_no": report_no}
 
 
 @app.post("/admin/reset")

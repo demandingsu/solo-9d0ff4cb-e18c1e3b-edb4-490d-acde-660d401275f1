@@ -1,4 +1,5 @@
 """LIMS 历史报告补采 API。"""
+import json
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -173,8 +174,8 @@ def get_results(portal_url: str, start: str, end: str):
         if pub is None:
             raise HTTPException(status_code=404, detail="该门户及区间暂无已发布结果")
         rows = conn.execute(
-            "SELECT report_no, sample_no, report_time, result FROM published_records"
-            " WHERE publication_id = ? ORDER BY report_time, report_no",
+            "SELECT report_no, sample_no, report_time, result, replaced_chain"
+            " FROM published_records WHERE publication_id = ? ORDER BY report_time, report_no",
             (pub["id"],),
         ).fetchall()
     return {
@@ -191,6 +192,8 @@ def get_results(portal_url: str, start: str, end: str):
                 "sample_no": r["sample_no"],
                 "report_time": fmt_ts(r["report_time"]),
                 "result": r["result"],
+                # 被该报告替代的原报告编号链（旧→新，不含自身）；无更正时为 []。
+                "replaced_report_nos": json.loads(r["replaced_chain"] or "[]"),
             }
             for r in rows
         ],

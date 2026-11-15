@@ -3,11 +3,13 @@
 采集在请求内同步执行，每个子区间的记录与进度在同一事务中落库，
 因此查询失败或服务重启后都可以按任务号从断点续采。
 """
+import json
 import threading
 
 import httpx
 
 from . import db
+from .chains import ChainConflictError, build_terminal_records
 from .timeutil import fmt_ts, now_iso, parse_ts
 
 MAX_ITEMS = 100          # 门户单次查询最多返回条数（不可翻页）
@@ -49,12 +51,15 @@ def _query_portal(portal_url: str, start_ts: int, end_ts: int) -> dict:
             raise CollectError(f"门户记录的报告时间非法: {item!r}") from exc
         if not (start_ts <= ts < end_ts):
             raise CollectError(f"门户返回了区间外的记录: {item!r}")
+        replaces = item.get("replaces_report_no")
         records.append(
             {
                 "report_no": str(item.get("report_no")),
                 "sample_no": item.get("sample_no"),
                 "report_time": ts,
                 "result": item.get("result"),
+                # 空串/None 统一为 None；引用先原样保存，完整性在归并阶段统一校验。
+                "replaces_report_no": str(replaces).strip() if replaces else None,
             }
         )
     if total <= MAX_ITEMS and total != len(records):
@@ -198,12 +203,20 @@ def _handle_response(task_id: int, round_no: int, interval, resp: dict) -> str:
                     (task_id, round_no, mid, e),
                 )
         else:
-            # 成功子区间：记录与进度同一事务落库。
+            # 成功子区间：记录与进度同一事务落库（含更正引用，跨子区间暂存）。
             conn.executemany(
-                "INSERT INTO records(task_id, round, report_no, sample_no, report_time, result)"
-                " VALUES(?,?,?,?,?,?)",
+                "INSERT INTO records(task_id, round, report_no, sample_no, report_time,"
+                " result, replaces_report_no) VALUES(?,?,?,?,?,?,?)",
                 [
-                    (task_id, round_no, r["report_no"], r["sample_no"], r["report_time"], r["result"])
+                    (
+                        task_id,
+                        round_no,
+                        r["report_no"],
+                        r["sample_no"],
+                        r["report_time"],
+                        r["result"],
+                        r["replaces_report_no"],
+                    )
                     for r in resp["records"]
                 ],
             )
@@ -264,12 +277,30 @@ def _finalize(task_id: int) -> None:
             )
             return
 
-        # 完整覆盖且批次一致：整体替换该门户及区间的已发布结果（单事务，失败保留旧结果）。
+        # 完整覆盖且批次一致：解析连续更正链并整体替换该门户及区间的已发布结果
+        # （单事务，失败保留旧结果）。
         rows = conn.execute(
-            "SELECT report_no, sample_no, report_time, result FROM records"
-            " WHERE task_id = ? AND round = ? ORDER BY report_time, report_no",
+            "SELECT report_no, sample_no, report_time, result, replaces_report_no"
+            " FROM records WHERE task_id = ? AND round = ?"
+            " ORDER BY report_time, report_no",
             (task_id, round_no),
         ).fetchall()
+        collected = [dict(r) for r in rows]
+
+    # 更正链归并在事务外计算（纯计算，无副作用）；冲突则任务失败、保留旧发布。
+    try:
+        terminals = build_terminal_records(collected)
+    except ChainConflictError as exc:
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'failed', error = ?, updated_at = ? WHERE id = ?",
+                (f"更正链冲突，未发布结果: {exc}", now_iso(), task_id),
+            )
+        return
+
+    now = now_iso()
+    with db.connect() as conn:
+        task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         old = conn.execute(
             "SELECT id FROM publications WHERE portal_url = ? AND start_ts = ? AND end_ts = ?",
             (task["portal_url"], task["start_ts"], task["end_ts"]),
@@ -285,18 +316,26 @@ def _finalize(task_id: int) -> None:
                 task["start_ts"],
                 task["end_ts"],
                 resp["batch"],
-                len(rows),
+                len(terminals),
                 task_id,
                 now,
             ),
         )
         publication_id = cur.lastrowid
+        # 报告、编号链、批次在同一事务发布，查询侧不会混读新旧版本。
         conn.executemany(
             "INSERT INTO published_records(publication_id, report_no, sample_no, report_time,"
-            " result) VALUES(?,?,?,?,?)",
+            " result, replaced_chain) VALUES(?,?,?,?,?,?)",
             [
-                (publication_id, r["report_no"], r["sample_no"], r["report_time"], r["result"])
-                for r in rows
+                (
+                    publication_id,
+                    r["report_no"],
+                    r["sample_no"],
+                    r["report_time"],
+                    r["result"],
+                    json.dumps(r["replaced_chain"], ensure_ascii=False),
+                )
+                for r in terminals
             ],
         )
         conn.execute(

@@ -7,13 +7,15 @@ DB_PATH = os.environ.get("DB_PATH", "/data/portal.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reports (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    report_no   TEXT NOT NULL,             -- 报告编号
-    sample_no   TEXT NOT NULL,             -- 样品号
-    report_time INTEGER NOT NULL,          -- 报告时间，epoch 秒
-    result      TEXT NOT NULL              -- 结果
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_no           TEXT NOT NULL,             -- 报告编号
+    sample_no           TEXT NOT NULL,             -- 样品号
+    report_time         INTEGER NOT NULL,          -- 报告时间，epoch 秒
+    result              TEXT NOT NULL,             -- 结果
+    replaces_report_no  TEXT                       -- 更正报告指向的原报告编号，NULL 表示普通报告
 );
 CREATE INDEX IF NOT EXISTS idx_reports_time ON reports(report_time);
+CREATE INDEX IF NOT EXISTS idx_reports_no ON reports(report_no);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -41,6 +43,10 @@ def init_db() -> None:
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)", (key, value)
             )
+        # 旧版本数据库的增量迁移。
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(reports)")}
+        if "replaces_report_no" not in cols:
+            conn.execute("ALTER TABLE reports ADD COLUMN replaces_report_no TEXT")
 
 
 @contextmanager
