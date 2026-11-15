@@ -1,0 +1,32 @@
+services:
+  portal:
+    build: ./portal
+    container_name: lims-portal
+    ports:
+      - "8001:8000"
+    environment:
+      DB_PATH: /data/portal.db
+    volumes:
+      - portal-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  api:
+    build: ./api
+    container_name: lims-api
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/api.db
+    volumes:
+      - api-data:/data
+    depends_on:
+      portal:
+        condition: service_healthy
+
+volumes:
+  portal-data:
+  api-data:
